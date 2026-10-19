@@ -1,0 +1,30 @@
+{
+  "_说明": "本机畅课 App 已登录时，本文件可以整份留空 —— 守护进程会自动复用 App 的登录态（零配置）。",
+  "_安全": "若填了 cookies，它是会话凭据，请 chmod 600，不要提交到 git。",
+
+  "session_source": "auto",
+  "_session_source": "auto = 没填 Cookie 时自动用本机 App；app = 强制用 App；config = 只用下面的 Cookie",
+
+  "base_url": "",
+  "cookies": "",
+  "x_session_id": "",
+
+  "force_ipv4": true,
+  "_force_ipv4": "优先 IPv4：本机 IPv6 路由不通时，urllib 会先连 IPv6 等超时再回落（实测每次白等 30 秒）",
+
+  "schedule_path": "课程表.json",
+
+  "clawbot_url": "http://127.0.0.1:8787/notify",
+  "clawbot_token": "",
+  "notify_enabled": true,
+
+  "gate_min_signed": 4,
+  "poll_in_window_s": 20,
+  "window_check_s": 5,
+
+  "coords": "",
+  "qr_fetch": true,
+
+  "state_path": "state.json",
+  "log_path": "changke.log"
+}

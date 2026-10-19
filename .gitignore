@@ -1,0 +1,17 @@
+# 凭据与本地状态（绝不要提交）
+config.json
+state.json
+device-id
+*.log
+*.log.*
+*.pid
+.env
+.env.*
+.DS_Store
+__pycache__/
+*.pyc
+
+# 本地参考与取证副本
+refs/
+.tmp/
+课程表.json

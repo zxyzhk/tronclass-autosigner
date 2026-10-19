@@ -1,0 +1,20 @@
+{
+  "_说明": "复制成 config.json 后填写。只填你实际使用的那一个通道的凭据，其余留空。",
+  "_安全": "config.json 含密钥，建议 chmod 600；clawbot 不会把它打印出来（回显一律打码）。",
+
+  "provider": "wecom",
+
+  "port": 8787,
+  "api_token": "",
+  "dedupe_window_s": 20,
+  "rate_per_min": 30,
+  "prefix": "【畅课】",
+
+  "wecom_webhook": "",
+  "serverchan_key": "",
+  "pushplus_token": "",
+  "wxpusher_app_token": "",
+  "wxpusher_uid": "",
+  "generic_url": "",
+  "generic_headers": {}
+}

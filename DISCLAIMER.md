@@ -1,0 +1,58 @@
+# 声明 / DISCLAIMER
+
+## 一、这是什么
+
+**这是厦门大学（XMU）畅课（TronClass，`https://lnt.xmu.edu.cn`）的自动签到工具。**
+
+- 接口口径按**厦门大学租户**实测编写与验证（点名列表、点名详情、数字码通道、二维码载荷与校验等）。
+- 其他学校的畅课租户接口语义大体一致，但**权限与字段可能不同**，需要自行核对后再用。
+- 本套件**不处理账号密码**，不使用教师凭据，也不访问他人账号。
+
+## 一点五、能力范围（不夸大）
+
+- **数字签到：完全自动**（轮询发现 → 取数字码 → 提交），已实现并有端到端测试。
+- **普通/点击签到：自动**；**GPS/雷达签到：自动但需先填教室坐标。**
+- **二维码签到：条件性自动。** QR 载荷中的 `create_time_hash` 由**服务端生成并校验**，
+  客户端无密钥、无法自行构造；学生会话读取码接口实测返回 403。
+  因此二维码能否免扫码全自动，**取决于该租户服务端是否校验 `data`** ——
+  守护进程会在**首次遇到真实二维码点名时自动做一次判定**：
+  不校验 ⇒ 此后二维码点名全自动；确实校验 ⇒ 提醒你人工提供码内容后用本地接口提交。
+
+> 本项目**不宣称**二维码在所有情况下都能自动完成；请以你所在租户的实测判定为准。
+
+## 二、允许的用途
+
+**仅用于快速签到等测试、研究与个人效率用途。** 例如：
+
+- 课堂上老师在群里/投屏发起数字签到时，你不必手忙脚乱找入口，**本人在场**的情况下快速完成签到；
+- 研究与学习：了解移动端/网页端与 LMS 的接口交互、客户端静态分析与协议复现；
+- 个人课表与考勤记录的自动化整理。
+
+## 三、严禁的用途
+
+**严禁用于旷课。**
+
+- **不得**在本人未实际到场、未实际参与课堂的情况下用它代签；
+- **不得**用伪造的二维码/数字码规避考勤；
+- **不得**用于替他人签到、批量代签或任何形式的考勤造假。
+
+用它伪造考勤记录属于**违反校纪校规**的行为，可能面临纪律处分。
+本项目的存在**不构成**对上述行为的任何许可或纵容。
+
+## 四、责任
+
+- 使用者需自行确认其所在院校的考勤规则与平台条款是否允许此类自动化；
+- 作者不对任何误用、账号封禁、考勤/成绩认定或纪律后果承担责任；
+- 若你所在院校或平台要求停止分发/使用本项目，请立即停止。
+
+---
+
+## English summary
+
+**This is an auto check-in tool for XMU's TronClass (`lnt.xmu.edu.cn`).**
+It is intended **only for fast check-in, testing, and research purposes** when you are
+actually present in class.
+
+**It must NOT be used to skip class (旷课).** Do not use it to fake attendance while absent,
+to sign in for others, or to circumvent attendance records. Faking attendance violates
+university rules and may lead to disciplinary action. The authors accept no liability for misuse.

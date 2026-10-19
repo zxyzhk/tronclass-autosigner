@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.local.clawbot</string>
+
+  <!-- 把下面两处 /REPLACE/WITH 换成 clawbot 所在目录的绝对路径 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/REPLACE/WITH/clawbot/clawbot.py</string>
+    <string>serve</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/REPLACE/WITH/clawbot</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/REPLACE/WITH/clawbot/clawbot.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/REPLACE/WITH/clawbot/clawbot.err.log</string>
+</dict>
+</plist>

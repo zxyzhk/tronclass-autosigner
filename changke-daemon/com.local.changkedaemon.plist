@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.local.changke-daemon</string>
+
+  <!-- 把 /REPLACE/WITH 换成 changke-daemon 目录的绝对路径 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/REPLACE/WITH/changke-daemon/changke_daemon.py</string>
+    <string>serve</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/REPLACE/WITH/changke-daemon</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/REPLACE/WITH/changke-daemon/daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/REPLACE/WITH/changke-daemon/daemon.err.log</string>
+</dict>
+</plist>
