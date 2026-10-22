@@ -2,7 +2,8 @@
 """测试用「假畅课」服务端：模拟真实接口与可控的签到场景。
 
 用环境变量控制：
-  MOCK_SCENARIO   number_gate | no_code | qr_403 | outside
+  MOCK_SCENARIO   number_gate | no_code | outside | stale | qr_unvalidated |
+                  qr_validated | radar | radar_coords | radar_nodist
   MOCK_DATE       HTTP Date 响应头（用来伪造「服务端时间」）
   MOCK_PORT       监听端口
   MOCK_RECORD     请求记录文件（JSON Lines）
@@ -24,6 +25,20 @@ STUDENT_ID = 12345
 COURSE_ID = 111
 ROLLCALL_ID = 9001
 NUMBER_CODE = "4821"
+
+# 位置签到测试夹具：合成目标点与允许半径，不对应真实教师或课堂
+RADAR_TARGET = (24.45, 118.09)
+RADAR_RADIUS = 60.0
+RADAR_STATE = {"signed": False}
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    import math
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
 
 
 def record(entry: dict) -> None:
@@ -48,6 +63,10 @@ def roster():
 
 
 def rollcall_row():
+    if SCENARIO in ("radar", "radar_coords", "radar_nodist"):
+        return {"id": ROLLCALL_ID, "is_number": False, "is_radar": True, "is_qr": False,
+                "type": "radar", "status": "absent",
+                "rollcall_time": "2026-10-19T08:40:00Z"}
     if SCENARIO in ("qr_unvalidated", "qr_validated"):
         return {"id": ROLLCALL_ID, "is_number": False, "is_radar": False, "is_qr": False,
                 "type": "qr_rollcall", "status": "absent",
@@ -110,6 +129,15 @@ class Handler(BaseHTTPRequestHandler):
                 detail = {"id": ROLLCALL_ID, "status": "in_progress",
                           "end_time": "2026-10-19T09:00:00Z",
                           "student_rollcalls": roster()}
+            if SCENARIO == "radar_coords":
+                detail["latitude"] = RADAR_TARGET[0]
+                detail["longitude"] = RADAR_TARGET[1]
+            if SCENARIO in ("radar", "radar_coords", "radar_nodist"):
+                detail["student_rollcalls"] = [
+                    {"student_id": 20000 + i, "rollcall_status": "on_call_fine"}
+                    for i in range(signed_count())] + [
+                    {"student_id": STUDENT_ID,
+                     "rollcall_status": "on_call_fine" if RADAR_STATE["signed"] else "absent"}]
             if SCENARIO == "number_gate":
                 detail["number_code"] = None       # 新通道：详情不再下发数字码
             self._json(200, detail)
@@ -149,7 +177,23 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, {"ok": True})
         elif path.endswith("/answer"):
-            self._json(200, {"ok": True})
+            if SCENARIO not in ("radar", "radar_coords", "radar_nodist"):
+                self._json(200, {"ok": True})
+                return
+            try:
+                body = json.loads(body or "{}")
+                lat, lon = float(body.get("latitude")), float(body.get("longitude"))
+            except Exception:
+                self._json(400, {"error": "bad payload"})
+                return
+            dist = haversine(lat, lon, *RADAR_TARGET)
+            if dist <= RADAR_RADIUS:
+                RADAR_STATE["signed"] = True
+                self._json(200, {"ok": True})
+            elif SCENARIO == "radar_nodist":
+                self._json(400, {"error": "out_of_range"})   # 不发距离
+            else:
+                self._json(400, {"distance": round(dist, 1)})
         else:
             self._json(404, {"error": "not found"})
         del body

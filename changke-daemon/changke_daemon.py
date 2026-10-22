@@ -9,7 +9,7 @@
   · 以服务端 Date 响应头校时：**不修改系统时间**，所有时间判断走校时后的 now()
   · 只在课表窗口内轮询（上课/课间前后 10 分钟，窗口内 20 秒一次），窗口外零签到请求
   · 门控：已签人数 >= N（默认 4）才提交；保底规则防漏签
-  · 数字签到全自动；GPS 需坐标；二维码先试服务端取码，取不到则提醒人工
+  · 数字签到全自动；GPS 优先取接口/缓存坐标，支持基于距离的定位；二维码支持载荷提交
   · 所有事件推送本地 clawbot -> 你的微信
   · 仅标准库，无需 pip 安装
 
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import email.utils
+import math
 import json
 import os
 import re
@@ -40,7 +41,7 @@ from datetime import datetime, timezone
 import app_session   # 同目录模块：读取本机畅课 App 的已登录会话（只读）
 import netfix        # 同目录模块：优先 IPv4，避开不通的 IPv6 路由
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MAX_BODY = 512 * 1024
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
@@ -70,7 +71,10 @@ DEFAULTS = {
     "qr_api_port": 8788,
     "qr_api_token": "",             # 可选：本地载荷接口的共享令牌
     "qr_poll_s": 0.7,               # 二维码取码频率（token 只活几秒）
-    "coords": "",                   # GPS 坐标 "纬度,经度"
+    "coords": "",                   # 手动指定位置签到坐标 "纬度,经度"（优先级最高）
+    "radar_auto": True,             # 位置签到：用"两圆交点"自动反推老师坐标
+    "radar_probe_coords": "24.3,118.0;24.6,118.2",  # 通用示例探针；可在本机配置为学校附近两点
+    "radar_tolerance_m": 5.0,       # 两圆不相交/包含时的误差容忍（米）
     "force_ipv4": True,             # 优先 IPv4：避开 IPv6 路由不通导致的每次 ~10s 超时
     "timeout_s": 10,
     "state_path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"),
@@ -141,8 +145,10 @@ def make_logger(cfg: dict):
     limit = int(cfg["log_max_bytes"])
 
     def log(msg: str, bad: bool = False) -> None:
-        stamp = datetime.fromtimestamp(now_ms(cfg) / 1000,
-                                       tz=timezone.utc).strftime("%H:%M:%S")
+        # 用学校当地时间打戳：避免把 UTC 误读成"早了 8 小时"
+        stamp = datetime.fromtimestamp(
+            (now_ms(cfg) + int(cfg["tz_offset_min"]) * 60000) / 1000,
+            tz=timezone.utc).strftime("%H:%M:%S")
         line = f"[{stamp}] {msg}"
         print(line, flush=True)
         try:
@@ -281,6 +287,60 @@ def parse_qr_payload(text: str):
     return None
 
 
+# ------------------------------------------------------------ 位置签到几何
+# 开源做法（XMU-Rollcall-Bot / XMU-AC）：越界提交会返回与目标点的 distance，
+# 用两次探针的距离求两圆交点，即可反推出老师的位置；再用候选点逐个提交验证。
+EARTH_R = 6371000.0
+
+
+def _latlon_to_xy(lat, lon, lat0, lon0):
+    x = math.radians(lon - lon0) * EARTH_R * math.cos(math.radians(lat0))
+    y = math.radians(lat - lat0) * EARTH_R
+    return x, y
+
+
+def _xy_to_latlon(x, y, lat0, lon0):
+    lat = lat0 + math.degrees(y / EARTH_R)
+    lon = lon0 + math.degrees(x / (EARTH_R * math.cos(math.radians(lat0))))
+    return lat, lon
+
+
+def circle_intersections(x1, y1, d1, x2, y2, d2, tolerance=5.0):
+    """两圆交点；在 tolerance 米内不相交/包含时微调半径使其相切。"""
+    d1, d2 = float(d1), float(d2)
+    dist = math.hypot(x2 - x1, y2 - y1)
+    if dist < 1e-9:
+        return None
+    if dist > d1 + d2:
+        # 两圆分离：仅在 GPS 误差容忍内接受，按"相切"处理
+        if dist - (d1 + d2) > tolerance:
+            return None
+    elif dist < abs(d1 - d2):
+        # 一圆包含另一圆：同上
+        if abs(d1 - d2) - dist > tolerance:
+            return None
+    a = (d1 ** 2 - d2 ** 2 + dist ** 2) / (2 * dist)
+    # 关键：不人为放大半径。相切/近似相切时 h 截断为 0 —— 唯一解就是切点，
+    # 上游代码用 +0.1 放大半径会凭空偏移十几米。
+    h = math.sqrt(max(0.0, d1 ** 2 - a ** 2))
+    xm = x1 + a * (x2 - x1) / dist
+    ym = y1 + a * (y2 - y1) / dist
+    rx = -(y2 - y1) * (h / dist)
+    ry = (x2 - x1) * (h / dist)
+    return (xm + rx, ym + ry), (xm - rx, ym - ry)
+
+
+def solve_target(lat1, lon1, lat2, lon2, d1, d2, tolerance=5.0):
+    lat0, lon0 = (lat1 + lat2) / 2, (lon1 + lon2) / 2
+    x1, y1 = _latlon_to_xy(lat1, lon1, lat0, lon0)
+    x2, y2 = _latlon_to_xy(lat2, lon2, lat0, lon0)
+    sols = circle_intersections(x1, y1, d1, x2, y2, d2, tolerance)
+    if not sols:
+        return None
+    return (_xy_to_latlon(sols[0][0], sols[0][1], lat0, lon0),
+            _xy_to_latlon(sols[1][0], sols[1][1], lat0, lon0))
+
+
 def school_local(cfg: dict, ts_ms: float = None) -> datetime:
     ms = now_ms(cfg) if ts_ms is None else ts_ms
     return datetime.fromtimestamp((ms + int(cfg["tz_offset_min"]) * 60000) / 1000,
@@ -346,6 +406,8 @@ class Schedule:
         day_map = {"星期一": 1, "星期二": 2, "星期三": 3, "星期四": 4,
                    "星期五": 5, "星期六": 6, "星期日": 0}
         by_day: dict[int, list] = {}
+        by_day_courses: dict[int, list] = {}
+        merged_by_day: dict[int, list] = {}
         for course in data.get("courses") or []:
             day = day_map.get(str(course.get("day", "")))
             span = str(course.get("time", "")).split("~")
@@ -357,6 +419,8 @@ class Schedule:
             except ValueError:
                 continue
             by_day.setdefault(day, []).append([start, end])
+            by_day_courses.setdefault(day, []).append(
+                {"s": start, "e": end, "name": str(course.get("name") or "")})
 
         pad = int(self.cfg["pad_min"])
         gap = int(self.cfg["merge_gap_min"])
@@ -370,8 +434,25 @@ class Schedule:
                 else:
                     merged.append([start, end])
             windows[day] = [[s - pad, e + pad] for s, e in merged]
+            merged_by_day[day] = merged
             self.used += len(spans)
         self.windows = windows
+        # 供窗口通知使用：课程名 + 未加宽的合并课段
+        self.courses = by_day_courses
+        self.sessions = {day: list(spans) for day, spans in merged_by_day.items()}
+
+    def names_for(self, day: int, win_start: int, win_end: int) -> list:
+        """窗口内涉及的课程名（按开课时间排序，去重）。"""
+        pad = int(self.cfg["pad_min"])
+        lo, hi = win_start + pad, win_end - pad
+        seen, names = set(), []
+        for course in self.courses.get(day, []):
+            if course["s"] < hi and course["e"] > lo:
+                name = course["name"]
+                if name and name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        return names
 
     def state(self, ts_ms: float = None):
         cfg = self.cfg
@@ -488,6 +569,7 @@ class State:
         self.seen = set()
         self.attempts = {}
         self.gate_since = {}
+        self.radar_cache = {}
         self.load()
 
     def load(self) -> None:
@@ -496,6 +578,9 @@ class State:
                 data = json.load(fh)
             self.seen = set(str(x) for x in (data.get("seen") or []))
             self.attempts = {str(k): int(v) for k, v in (data.get("attempts") or {}).items()}
+            self.radar_cache = {str(k): [float(v[0]), float(v[1])]
+                                for k, v in (data.get("radar_cache") or {}).items()
+                                if isinstance(v, (list, tuple)) and len(v) == 2}
         except (OSError, ValueError, TypeError):
             pass
 
@@ -503,8 +588,8 @@ class State:
         tmp = self.path + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"seen": sorted(self.seen), "attempts": self.attempts}, fh,
-                          ensure_ascii=False)
+                json.dump({"seen": sorted(self.seen), "attempts": self.attempts,
+                           "radar_cache": self.radar_cache}, fh, ensure_ascii=False)
             os.replace(tmp, self.path)
         except OSError:
             pass
@@ -565,13 +650,17 @@ class HTTP:
 
 # ------------------------------------------------------------------ 通知
 
-def notify(cfg: dict, log, title: str, body: str, dedupe: set) -> None:
+def notify(cfg: dict, log, title: str, body: str, dedupe: set,
+           retries: int = 3) -> bool:
+    """推送一条通知；失败时有界重试（网络抖动很常见，不能一次失败就丢消息）。
+
+    返回本地中继是否接受。仅接受成功后标记去重，实际微信送达取决于推送通道。
+    """
     if not cfg["notify_enabled"] or not cfg["clawbot_url"]:
-        return
+        return False
     key = f"{title}|{body}"
     if key in dedupe:
-        return
-    dedupe.add(key)
+        return True                     # 已通知过
     payload = {"title": title, "body": body, "source": "changke-daemon",
                "event": "changke", "at": datetime.fromtimestamp(
                    now_ms(cfg) / 1000, tz=timezone.utc).isoformat()}
@@ -579,16 +668,29 @@ def notify(cfg: dict, log, title: str, body: str, dedupe: set) -> None:
     if cfg["clawbot_token"]:
         headers["X-Clawbot-Token"] = str(cfg["clawbot_token"])
     url = str(cfg["clawbot_url"])
-    try:
-        req = urllib.request.Request(
-            url, data=json.dumps(payload).encode("utf-8"), method="POST",
-            headers={"Content-Type": "application/json", **headers})
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(req, timeout=6) as resp:
-            resp.read(4096)
-        log(f"[微信] 已推送：{title}")
-    except Exception as exc:
-        log(f"[微信] 推送失败（{type(exc).__name__}）——clawbot 是否在运行？", True)
+    # 仅在剩余重试前等待：默认三次尝试，间隔 2s / 5s。
+    delays = [2, 5, 10]
+    last_error = ""
+    attempts = max(1, retries)
+    for attempt in range(attempts):
+        try:
+            req = urllib.request.Request(
+                url, data=json.dumps(payload).encode("utf-8"), method="POST",
+                headers={"Content-Type": "application/json", **headers})
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=8) as resp:
+                resp.read(4096)
+            dedupe.add(key)
+            log(f"[微信] 已推送：{title}" + (f"（第 {attempt + 1} 次尝试成功）" if attempt else ""))
+            return True
+        except Exception as exc:
+            last_error = type(exc).__name__
+            if attempt + 1 < attempts:
+                delay = delays[min(attempt, len(delays) - 1)]
+                log(f"[微信] 推送失败（{last_error}），{delay}s 后重试…", True)
+                time.sleep(delay)
+    log(f"[微信] 推送最终失败（{last_error}）——请检查网络与 clawbot", True)
+    return False
 
 
 # ------------------------------------------------------------------ 核心
@@ -625,6 +727,7 @@ class Daemon:
         self.log = log
         self.dry_run = dry_run
         self.app = resolve_app_session(cfg, log)
+        self.started_at = now_ms(cfg)      # 停止通知里要报"本次运行时长"
         self.renewing = False
         self.last_renew = 0.0
 
@@ -659,6 +762,8 @@ class Daemon:
         self.qr_targets: dict[str, dict] = {}
         self.qr_gate: dict[str, dict] = {}
         self.qr_probe: dict[str, bool] = {}   # rid -> 是否已做过"服务端是否校验"探测
+        self.win_notified: set = set()        # 已推送过"开始检测"的窗口
+        self.win_retry_at = 0.0               # 窗口通知失败后的重试冷却
         self.state_lock = threading.Lock()
         self.last_poll = 0.0
         self.active = False
@@ -833,6 +938,141 @@ class Daemon:
             pass
         return value
 
+    # -- 位置签到（GPS/雷达）---------------------------------------------
+    def _radar_payload(self, lat, lon):
+        return {"accuracy": 35, "altitude": 0, "altitudeAccuracy": None,
+                "deviceId": self.device_id(), "heading": None,
+                "latitude": str(lat), "longitude": str(lon), "speed": None}
+
+    def _radar_submit(self, rid, lat, lon):
+        """提交一次位置签到；返回 (status, distance, body)。越界时服务端会给 distance。"""
+        status, body, _ = self.http.put(f"/api/rollcall/{rid}/answer",
+                                        self._radar_payload(lat, lon))
+        distance = None
+        data = jload(body)
+        if isinstance(data, dict):
+            distance = data.get("distance")
+            if distance is None and isinstance(data.get("data"), dict):
+                distance = data["data"].get("distance")
+        return status, distance, body
+
+    def _radar_confirmed(self, rid) -> bool:
+        """回查名单确认本人已签上。"""
+        detail = self.detail(rid)
+        roster = detail.get("student_rollcalls") if isinstance(detail, dict) else None
+        if not roster:
+            return False
+        for student in roster:
+            if str(student.get("student_id")) == str(self.sid):
+                return student.get("rollcall_status") == "on_call_fine"
+        return False
+
+    def _probe_coords(self):
+        points = []
+        for part in str(self.cfg.get("radar_probe_coords") or "").split(";"):
+            if "," in part:
+                left, right = part.split(",", 1)
+                try:
+                    points.append((float(left), float(right)))
+                except ValueError:
+                    pass
+        if len(points) < 2:
+            points = [(24.3, 118.0), (24.6, 118.2)]
+        return points[0], points[1]
+
+    def answer_radar_auto(self, rid, cid, name, detail=None, rc=None):
+        """位置签到：四级优先级取坐标。
+
+        0) config.coords 显式指定
+        1) 接口直接给的 latitude/longitude
+        2) 本课程上次解出的缓存坐标
+        3) 三角定位（两次探针 distance → 两圆交点 → 逐个候选验证）
+        返回 (是否成功, 说明)。
+        """
+        cfg = self.cfg
+        if self.dry_run:
+            self.log(f"[dry-run] 本应做位置签到 rid={rid}")
+            return False, "dry-run"
+
+        # 0) 显式配置
+        raw = str(cfg.get("coords") or "")
+        if "," in raw:
+            left, right = raw.split(",", 1)
+            try:
+                lat, lon = float(left), float(right)
+            except ValueError:
+                lat = lon = None
+            if lat is not None:
+                status, _, _ = self._radar_submit(rid, lat, lon)
+                if status == 200 and self._radar_confirmed(rid):
+                    return True, f"配置坐标({lat}, {lon})"
+                return False, f"配置坐标提交 HTTP {status}"
+
+        # 1) 接口里直接带坐标
+        for src, label in ((detail, "点名详情"), (rc, "签到列表")):
+            if isinstance(src, dict):
+                lat, lon = src.get("latitude"), src.get("longitude")
+                if lat not in (None, "", 0, "0") and lon not in (None, "", 0, "0"):
+                    status, _, _ = self._radar_submit(rid, lat, lon)
+                    if status == 200 and self._radar_confirmed(rid):
+                        return True, f"{label}坐标({lat}, {lon})"
+                    self.log(f"[位置] {label}坐标提交 HTTP {status}", True)
+
+        # 2) 缓存坐标
+        cached = self.state.radar_cache.get(str(cid))
+        if cached:
+            status, _, _ = self._radar_submit(rid, cached[0], cached[1])
+            if status == 200 and self._radar_confirmed(rid):
+                return True, f"缓存坐标({cached[0]:.6f}, {cached[1]:.6f})"
+
+        # 3) 三角定位
+        if not cfg.get("radar_auto", True):
+            return False, "未开启三角定位，且无可用坐标"
+        (lat1, lon1), (lat2, lon2) = self._probe_coords()
+        status1, d1, _ = self._radar_submit(rid, lat1, lon1)
+        if status1 == 200 and self._radar_confirmed(rid):
+            return True, "探针 1 直接命中（未限制范围）"
+        status2, d2, _ = self._radar_submit(rid, lat2, lon2)
+        if status2 == 200 and self._radar_confirmed(rid):
+            return True, "探针 2 直接命中（未限制范围）"
+
+        if d1 is None or d2 is None:
+            return False, ("服务端未返回 distance，三角定位不可用"
+                           f"（HTTP {status1}/{status2}）")
+        self.log(f"[位置] 探针距离 d1={d1}m d2={d2}m")
+        solutions = solve_target(lat1, lon1, lat2, lon2, float(d1), float(d2),
+                                 float(cfg.get("radar_tolerance_m", 5.0)))
+        if not solutions:
+            return False, f"两圆无交点（d1={d1}, d2={d2}）"
+        def _haversine(p, q):
+            la1, lo1 = math.radians(p[0]), math.radians(p[1])
+            la2, lo2 = math.radians(q[0]), math.radians(q[1])
+            dlat, dlon = la2 - la1, lo2 - lo1
+            a = (math.sin(dlat / 2) ** 2
+                 + math.cos(la1) * math.cos(la2) * math.sin(dlon / 2) ** 2)
+            return 2 * EARTH_R * math.asin(math.sqrt(a))
+
+        tolerance = float(cfg.get("radar_tolerance_m", 5.0))
+        for index, cand in enumerate(solutions):
+            current = (float(cand[0]), float(cand[1]))
+            # 第一个候选做迭代精化：把当前估计当作新探针，用服务端返回的
+            # distance 反解一次 —— 估计点离目标越近，几何条件越好，误差收敛很快。
+            for step in range(3 if index == 0 else 1):
+                status, dist, _ = self._radar_submit(rid, current[0], current[1])
+                if status == 200 and self._radar_confirmed(rid):
+                    self.state.radar_cache[str(cid)] = [current[0], current[1]]
+                    self.state.save()
+                    extra = f"·精化{step}次" if step else ""
+                    return True, f"三角定位({current[0]:.6f}, {current[1]:.6f}){extra}"
+                if dist is None or step >= 2:
+                    break
+                refined = solve_target(lat1, lon1, current[0], current[1],
+                                       float(d1), float(dist), tolerance)
+                if not refined:
+                    break
+                current = min(refined, key=lambda p: _haversine(p, current))
+        return False, "候选坐标均未确认成功"
+
     # -- 门控 ------------------------------------------------------------
     def gate(self, rid):
         cfg = self.cfg
@@ -890,6 +1130,81 @@ class Daemon:
                       f"  rollcall_time={rc.get('rollcall_time')}")
         print(f"\n合计 {total} 条签到记录")
 
+
+    # -- 生命周期通知 ----------------------------------------------------
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        total = int(max(0, seconds))
+        hours, rem = divmod(total, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours:
+            return f"{hours} 小时 {minutes} 分"
+        if minutes:
+            return f"{minutes} 分 {secs} 秒"
+        return f"{secs} 秒"
+
+    def window_brief(self) -> str:
+        """一句话概括当前窗口状态与下一个窗口还有多久。"""
+        state = self.schedule.state()
+        if state["in"]:
+            return (f"当前【窗口内】{hhmm(state['win'][0])}~{hhmm(state['win'][1])}"
+                    f"（{DOW_NAME[state['dow']]}），{self.cfg['poll_in_window_s']} 秒轮询中")
+        nxt = state["next"]
+        if not nxt:
+            return "当前【窗口外】，近 7 天无课"
+        away = self._fmt_duration(nxt["delta"] * 60)
+        return (f"当前【窗口外】；下一个窗口 {DOW_NAME[nxt['day']]} "
+                f"{hhmm(nxt['at'])}~{hhmm(nxt['end'])}（约 {away} 后开始）")
+
+    def notify_start(self) -> None:
+        local = school_local(self.cfg)
+        body = "\n".join([
+            f"启动时间：{local.strftime('%m-%d %H:%M')}（北京时间）",
+            self.window_brief(),
+            f"门控：满 {self.cfg['gate_min_signed']} 人后自动签到",
+            f"轮询：仅在窗口内，每 {self.cfg['poll_in_window_s']} 秒一次",
+            "收到停止信号时会再推一条（含本次运行时长）",
+        ])
+        notify(self.cfg, self.log, "🟢 畅课守护进程已启动", body, set())
+
+    def notify_window_start(self, state: dict) -> None:
+        """进入检测窗口时推送：哪节课、窗口区间、本次持续多久、门控设置。"""
+        day, (win_start, win_end) = state["dow"], state["win"]
+        now_minutes = state["minutes"]
+        local = school_local(self.cfg)
+        key = f"win:{local.strftime('%Y-%m-%d')}:{day}:{win_start}"
+        if key in self.win_notified:
+            return
+        if now_ms(self.cfg) - self.win_retry_at < 60000:
+            return                          # 失败后 60s 内不重复打（窗口内每轮都会被调用）
+
+        names = self.schedule.names_for(day, win_start, win_end)
+        remain = max(0, win_end - now_minutes)
+        body = "\n".join(filter(None, [
+            f"课程：{'、'.join(names)}" if names else "",
+            f"检测窗口：{hhmm(win_start)}~{hhmm(win_end)}（{DOW_NAME[day]}，"
+            f"课程时段前后各放宽 {self.cfg['pad_min']} 分钟）",
+            f"本次持续：约 {self._fmt_duration(remain * 60)}（到 {hhmm(win_end)} 为止）",
+            f"轮询：每 {self.cfg['poll_in_window_s']} 秒一次",
+            f"门控：满 {self.cfg['gate_min_signed']} 人后自动签",
+        ]))
+        sent = notify(self.cfg, self.log,
+                      f"🟢 开始 {self.cfg['poll_in_window_s']} 秒检测 · {DOW_NAME[day]}",
+                      body, set())
+        if sent:
+            self.win_notified.add(key)      # 只在送达后标记；失败则下轮再试
+        else:
+            self.win_retry_at = now_ms(self.cfg)
+            self.log("[微信] 窗口开始通知未送达，60s 后重试", True)
+
+    def notify_stop(self, reason: str = "") -> None:
+        local = school_local(self.cfg)
+        body = "\n".join([
+            f"停止时间：{local.strftime('%m-%d %H:%M')}（北京时间）",
+            f"本次运行：{self._fmt_duration((now_ms(self.cfg) - self.started_at) / 1000.0)}",
+            f"原因：{reason or '正常退出'}",
+        ])
+        notify(self.cfg, self.log, "🔴 畅课守护进程已停止", body, set())
 
     def _skip(self, rid: str) -> None:
         """标记为已处理：不再重复查询、也不再提醒。"""
@@ -955,6 +1270,10 @@ class Daemon:
                             self.log(f"[等待] {name}：{msg}")
                         continue
 
+                if is_radar and self.dry_run:
+                    self.log(f"[dry-run] 本应做位置签到 rid={rid}")
+                    continue
+
                 self.state.attempts[rid] = int(self.state.attempts.get(rid, 0)) + 1
                 attempts = self.state.attempts[rid]
 
@@ -985,22 +1304,17 @@ class Daemon:
                     continue
 
                 if is_radar:
-                    match = None
-                    raw = str(cfg.get("coords") or "")
-                    if "," in raw:
-                        left, right = raw.split(",", 1)
-                        try:
-                            match = (float(left), float(right))
-                        except ValueError:
-                            match = None
-                    if not match:
-                        notify(cfg, self.log, f"📍 需要坐标 · {name}",
-                               "GPS/雷达签到，请在 config.json 填 coords", self.dedupe)
-                        continue
-                    if self.answer_radar(rid, match[0], match[1]):
-                        self.state.seen.add(rid)
-                        notify(cfg, self.log, f"✅ GPS 签到成功 · {name}",
-                               f"({match[0]}, {match[1]})", self.dedupe)
+                    ok, reason = self.answer_radar_auto(rid, cid, name,
+                                                        detail=detail, rc=rc)
+                    if ok:
+                        self._skip(rid)
+                        notify(cfg, self.log, f"✅ 位置签到成功 · {name}", reason, self.dedupe)
+                    elif attempts >= int(cfg["max_attempts"]):
+                        self._skip(rid)
+                        notify(cfg, self.log, f"❌ 位置签到未成功 · {name}",
+                               f"{reason}；可在 config.json 填 coords 手动指定", self.dedupe)
+                    elif attempts == 1:
+                        self.log(f"[位置] {name}：{reason}，将重试", True)
                     continue
 
                 if is_qr:
@@ -1144,6 +1458,7 @@ class Daemon:
         sync_clock(self.http, cfg, self.log, force=True)
         self.log(f"[启动] 畅课后台轮询 v{VERSION}｜窗口内 {cfg['poll_in_window_s']}s｜"
                  f"门控 {cfg['gate_min_signed']} 人" + ("（dry-run）" if self.dry_run else ""))
+        self.notify_start()                  # 启动即推送（含窗口/持续时间信息）
         api = None
         if cfg.get("qr_api_enabled", True):
             api = QrApi(self, self.log, int(cfg["qr_api_port"]),
@@ -1170,6 +1485,10 @@ class Daemon:
                 self.log(f"[课表] 进入窗口 {hhmm(state['win'][0])}~{hhmm(state['win'][1])}"
                          f"（{DOW_NAME[state['dow']]} {local.strftime('%H:%M')}）——开始轮询")
                 sync_clock(self.http, cfg, self.log, force=True)
+
+            # 窗口内每轮都尝试（内部有"已送达"与 60s 冷却双重判断）：
+            # 这样即使通知发送时网络抖动，也会在窗口内自动补发
+            self.notify_window_start(state)
 
             if (now_ms(cfg) - self.last_poll) / 1000.0 >= int(cfg["poll_in_window_s"]):
                 self.last_poll = now_ms(cfg)
@@ -1360,7 +1679,10 @@ def main() -> int:
 
     daemon = Daemon(cfg, log, dry_run=args.dry_run)
 
+    reason = {"text": ""}
+
     def on_signal(signum, frame):
+        reason["text"] = f"收到信号 {signum}"
         log(f"[停止] 收到信号 {signum}，正在退出")
         STOP.set()
 
@@ -1373,7 +1695,15 @@ def main() -> int:
     if args.action == "once":
         daemon.once()
         return 0
-    daemon.loop()
+
+    try:
+        daemon.loop()
+    except Exception as exc:                      # 异常也要让微信知道
+        log(f"[错误] 主循环异常退出：{type(exc).__name__}: {exc}", True)
+        reason["text"] = f"异常退出（{type(exc).__name__}）"
+        raise
+    finally:
+        daemon.notify_stop(reason.get("text") or "正常退出")
     return 0
 
 
